@@ -12,6 +12,8 @@
 4. [EXPLAIN 执行计划深度解读](#第四章explain-执行计划深度解读)
 5. [慢 SQL 定位与排查工作流](#第五章慢-sql-定位与排查工作流)
 6. [常见优化案例与 SQL 改写技巧](#第六章常见优化案例与-sql-改写技巧)
+   - [6.4 JOIN 优化（笛卡尔积 / 临时表 / NLJ & Hash Join）](#64-join-优化)
+   - [6.6 子查询优化（关联子查询 / IN·EXISTS / 派生表 / 标量子查询）](#66-子查询优化)
 7. [其他 MySQL 性能优化手段](#第七章其他-mysql-性能优化手段)
 8. [生产环境排查 SOP](#第八章生产环境排查-sop)
 9. [回表专题——代价、原理与解决方案](#第九章回表专项代价原理与解决方案)
@@ -987,6 +989,186 @@ SELECT * FROM a JOIN b ON a.user_id = b.id;
 ALTER TABLE b CONVERT TO CHARACTER SET utf8mb4;
 ```
 
+#### 6.4.1 笛卡尔积：最危险的 JOIN 错误
+
+**笛卡尔积（Cartesian Product）**：两张表 JOIN 时缺少 ON 关联条件，MySQL 把左表每一行和右表每一行两两配对，结果行数 = 左表行数 × 右表行数。
+
+```sql
+-- ❌ 经典笛卡尔积：忘写 ON 条件
+-- user 表 100 万行，order 表 500 万行 → 结果 5 万亿行，直接把 DB 打死
+SELECT u.id, o.order_no
+FROM user u, `order` o;   -- 逗号写法，隐式 CROSS JOIN
+
+-- ❌ CROSS JOIN 显式写法，效果一样
+SELECT u.id, o.order_no
+FROM user u CROSS JOIN `order` o;
+
+-- ❌ 虽然有 WHERE，但条件写错成非关联条件，仍然是笛卡尔积
+SELECT u.id, o.order_no
+FROM user u
+INNER JOIN `order` o ON u.status = 1;  -- ON 条件没关联两表！
+```
+
+```sql
+-- ✅ 正确写法：ON 条件必须关联两张表的列
+SELECT u.id, u.username, o.order_no
+FROM user u
+INNER JOIN `order` o ON o.user_id = u.id  -- 两表关联列
+WHERE u.status = 1;
+```
+
+**如何发现笛卡尔积**：
+
+```sql
+-- EXPLAIN 中 type = ALL 且 rows 极大，Extra 无 Using where 的被驱动表
+-- 或者观察 rows 列：驱动表 rows × 被驱动表 rows = 结果估算行数
+EXPLAIN SELECT u.id, o.order_no FROM user u, `order` o;
+-- type: ALL  rows: 1000000（user）× 5000000（order） → 5万亿次循环
+```
+
+**三表 JOIN 时笛卡尔积更隐蔽**：
+
+```sql
+-- ❌ 三表 JOIN，第二个关联条件写漏了
+SELECT u.username, r.role_name, p.perm_code
+FROM sys_user u
+INNER JOIN sys_user_role ur ON ur.user_id = u.id
+INNER JOIN sys_role r       ON r.id = ur.role_id
+INNER JOIN sys_permission p;  -- 漏写 ON，sys_permission 全表笛卡尔积！
+
+-- ✅ 每个 JOIN 都要有 ON 条件
+SELECT u.username, r.role_name, p.perm_code
+FROM sys_user u
+INNER JOIN sys_user_role ur    ON ur.user_id  = u.id
+INNER JOIN sys_role r          ON r.id        = ur.role_id
+INNER JOIN sys_role_permission rp ON rp.role_id = r.id
+INNER JOIN sys_permission p    ON p.id        = rp.perm_id
+WHERE u.id = 12345;
+```
+
+---
+
+#### 6.4.2 临时表：隐藏的性能杀手
+
+MySQL 在以下场景会自动创建内部临时表（`Using temporary`），临时表会占用 `tmp_table_size` 内存，超限后落盘变磁盘临时表，性能急剧下降：
+
+| 触发场景 | 典型 SQL | 解决思路 |
+|---------|---------|---------|
+| GROUP BY 列没有索引 | `GROUP BY city_id`（无索引） | 给 GROUP BY 列加索引 |
+| GROUP BY 列与 ORDER BY 列不同 | `GROUP BY dept_id ORDER BY COUNT(*)` | 应用层排序，或覆盖索引 |
+| DISTINCT 无法走索引 | `SELECT DISTINCT status` | 确保列有索引 |
+| UNION（非 UNION ALL）去重 | `SELECT ... UNION SELECT ...` | 能用 UNION ALL 就不用 UNION |
+| 子查询 / 派生表 | `FROM (SELECT ...) t` | 改写为 JOIN，或物化为真实表 |
+| 多表 JOIN 后 GROUP BY | 见下方示例 | 先聚合再 JOIN |
+
+```sql
+-- ❌ 触发临时表：JOIN 之后再 GROUP BY 非索引列
+EXPLAIN
+SELECT u.dept_id, COUNT(*) AS cnt
+FROM sys_user u
+INNER JOIN sys_user_role ur ON ur.user_id = u.id
+GROUP BY u.dept_id
+ORDER BY cnt DESC;
+-- Extra: Using temporary; Using filesort ← 两个坏信号同时出现
+
+-- ✅ 优化思路一：给 GROUP BY 列加索引（dept_id 已有索引时优化器可利用）
+-- sys_user 已有 idx_dept_id，GROUP BY u.dept_id 可走索引分组
+
+-- ✅ 优化思路二：先聚合再 JOIN（减少 JOIN 的中间数据量）
+SELECT t.dept_id, t.cnt
+FROM (
+    SELECT dept_id, COUNT(*) AS cnt
+    FROM sys_user
+    GROUP BY dept_id          -- 先在单表聚合，走 idx_dept_id
+) t
+ORDER BY t.cnt DESC;
+-- 如果还需要部门名称才 JOIN dept 表
+SELECT t.dept_id, d.dept_name, t.cnt
+FROM (
+    SELECT dept_id, COUNT(*) AS cnt
+    FROM sys_user
+    GROUP BY dept_id
+) t
+INNER JOIN sys_dept d ON d.id = t.dept_id
+ORDER BY t.cnt DESC;
+```
+
+```sql
+-- ❌ UNION 触发临时表去重
+SELECT user_id FROM order_2023 WHERE status = 1
+UNION
+SELECT user_id FROM order_2024 WHERE status = 1;
+-- UNION 要对两个结果集做去重，内部建临时表
+
+-- ✅ 如果业务允许重复，改用 UNION ALL（不去重，无临时表）
+SELECT user_id FROM order_2023 WHERE status = 1
+UNION ALL
+SELECT user_id FROM order_2024 WHERE status = 1;
+
+-- ✅ 如果一定要去重，在应用层去重，或者套一层 SELECT DISTINCT
+SELECT DISTINCT user_id FROM (
+    SELECT user_id FROM order_2023 WHERE status = 1
+    UNION ALL
+    SELECT user_id FROM order_2024 WHERE status = 1
+) t;
+```
+
+```sql
+-- 查看临时表使用情况（监控用）
+SHOW STATUS LIKE 'Created_tmp%';
+-- Created_tmp_tables       内存临时表创建次数
+-- Created_tmp_disk_tables  落盘临时表创建次数（这个高了就要优化）
+-- 比值 Created_tmp_disk_tables / Created_tmp_tables > 10% 说明临时表频繁落盘
+
+-- 调整临时表大小（默认 16MB，可根据内存适当调大）
+SHOW VARIABLES LIKE 'tmp_table_size';
+SHOW VARIABLES LIKE 'max_heap_table_size';
+-- 两者取较小值作为内存临时表上限，超过后落盘
+```
+
+---
+
+#### 6.4.3 JOIN 执行机制：NLJ 与 Hash Join
+
+理解 JOIN 的执行算法有助于写出更优的 SQL：
+
+**Nested-Loop Join（NLJ）——MySQL 默认**
+
+```
+for each row in 驱动表（过滤后）:
+    for each matching row in 被驱动表（走索引）:
+        output row
+```
+
+- 被驱动表有索引 → 每次内层查询 O(log n)，整体很快
+- 被驱动表无索引 → 退化为 Block Nested-Loop（BNL），内层全扫，`Extra: Using join buffer`
+
+```sql
+-- Using join buffer 说明被驱动表没走索引
+-- 解决：给 ON 条件的被驱动表列加索引
+ALTER TABLE sys_user_role ADD INDEX idx_user_id(user_id);
+```
+
+**Hash Join（MySQL 8.0.18+ 引入）**
+
+- 适用于等值 JOIN（`=`），且被驱动表无合适索引时自动使用
+- 把小表 build 成 Hash 表放内存，大表 probe（探测）
+- `EXPLAIN` 中 Extra 显示 `Using hash`，性能远优于 BNL
+
+```sql
+-- 查看当前 MySQL 是否支持 Hash Join
+SELECT @@version;  -- 8.0.18+
+
+-- EXPLAIN FORMAT=TREE 可以清楚看到 Hash Join
+EXPLAIN FORMAT=TREE
+SELECT u.username, o.order_no
+FROM user u
+JOIN `order` o ON o.user_id = u.id\G
+-- 输出中看到 -> Hash join... 说明走了 Hash Join
+```
+
+---
+
 ### 6.5 COUNT 优化
 
 ```sql
@@ -1003,18 +1185,203 @@ SELECT COUNT(status) FROM `order`;  -- status 有索引
 -- ✅ 方案三：SHOW TABLE STATUS 的 Rows 字段（近似值）
 ```
 
-### 6.6 IN / EXISTS 选择
-
 ```sql
--- 内表（子查询）数据量小，用 IN
-SELECT * FROM `order` WHERE user_id IN (SELECT id FROM vip_user);
+-- COUNT(*) / COUNT(1) / COUNT(id) 性能基本一致
+-- COUNT(*) 包含 NULL，COUNT(列名) 不包含 NULL
 
--- 外表数据量小，用 EXISTS
-SELECT * FROM user u
-WHERE EXISTS (SELECT 1 FROM `order` o WHERE o.user_id = u.id);
+-- ❌ 慢：InnoDB 的 COUNT(*) 每次都需要扫描
+SELECT COUNT(*) FROM `order`;
+
+-- ✅ 方案一：用选择性高的二级索引列（索引树更小）
+SELECT COUNT(status) FROM `order`;  -- status 有索引
+
+-- ✅ 方案二：用统计表缓存 COUNT 值（高并发场景）
+-- ✅ 方案三：SHOW TABLE STATUS 的 Rows 字段（近似值）
 ```
 
-> 💡 MySQL 8.0 优化器已对两者做了趋同优化，现代版本差异不大，优先考虑可读性。
+### 6.6 子查询优化
+
+子查询按执行方式分为两大类，优化策略截然不同。
+
+#### 6.6.1 关联子查询（Correlated Subquery）——最危险
+
+关联子查询指子查询中引用了外层查询的列，导致**外层每扫一行，子查询就执行一次**，复杂度 O(n²)。
+
+```sql
+-- ❌ 关联子查询：外层扫 100 万用户，内层每次查一次 order 表
+SELECT u.id, u.username,
+       (SELECT COUNT(*) FROM `order` o WHERE o.user_id = u.id) AS order_cnt
+FROM user u
+WHERE u.status = 1;
+-- EXPLAIN: 子查询 type=ref，但执行 100 万次，总代价极高
+
+-- ✅ 改写为 LEFT JOIN + GROUP BY（一次聚合）
+SELECT u.id, u.username, COUNT(o.id) AS order_cnt
+FROM user u
+LEFT JOIN `order` o ON o.user_id = u.id
+WHERE u.status = 1
+GROUP BY u.id, u.username;
+-- 只扫两张表各一次，性能数量级提升
+```
+
+```sql
+-- ❌ WHERE 中的关联子查询（逐行执行）
+SELECT * FROM user u
+WHERE u.create_time > (
+    SELECT MAX(login_time) FROM login_log l WHERE l.user_id = u.id
+);
+
+-- ✅ 改写：先聚合成派生表，再 JOIN
+SELECT u.*
+FROM user u
+INNER JOIN (
+    SELECT user_id, MAX(login_time) AS last_login
+    FROM login_log
+    GROUP BY user_id
+) t ON t.user_id = u.id
+WHERE u.create_time > t.last_login;
+```
+
+---
+
+#### 6.6.2 IN / EXISTS / NOT IN / NOT EXISTS 选择
+
+**IN vs EXISTS 的底层逻辑**
+
+```sql
+-- IN：先执行子查询，把结果集加载到内存，外层用 Hash 匹配
+SELECT * FROM `order` WHERE user_id IN (SELECT id FROM vip_user);
+-- 适合：子查询结果集小（vip_user 少），外层大表
+
+-- EXISTS：对外层每一行，执行一次子查询，只要找到一行就停止
+SELECT * FROM user u
+WHERE EXISTS (SELECT 1 FROM `order` o WHERE o.user_id = u.id);
+-- 适合：外层结果集小，子查询可快速命中索引
+```
+
+| 场景 | 推荐 | 原因 |
+|------|------|------|
+| 子查询结果集小 | IN | 子查询结果 Hash 到内存，外层快速匹配 |
+| 外层结果集小 | EXISTS | 外层行少，子查询执行次数少 |
+| 子查询有索引 | 两者差不多 | MySQL 8.0 优化器会自动转换 |
+| 子查询结果集大 | EXISTS | IN 会撑爆内存临时表 |
+
+> 💡 MySQL 8.0 优化器对 IN 的子查询会尝试转换为 semi-join（半连接），与 EXISTS 性能趋同。**优先考虑可读性，遇到慢查询再看 EXPLAIN**。
+
+**NOT IN 的陷阱：NULL 导致结果全空**
+
+```sql
+-- ❌ NOT IN 遇到 NULL 返回空结果集！
+-- 假设 vip_user.id 有一行 NULL
+SELECT * FROM user WHERE id NOT IN (SELECT id FROM vip_user);
+-- 结果：0 行！因为 NOT IN NULL 的逻辑是 UNKNOWN，整体过滤掉所有行
+
+-- ✅ 用 NOT EXISTS 代替 NOT IN（对 NULL 安全）
+SELECT * FROM user u
+WHERE NOT EXISTS (SELECT 1 FROM vip_user v WHERE v.id = u.id);
+
+-- ✅ 或者 LEFT JOIN + IS NULL（反连接）
+SELECT u.*
+FROM user u
+LEFT JOIN vip_user v ON v.id = u.id
+WHERE v.id IS NULL;
+```
+
+---
+
+#### 6.6.3 派生表（FROM 子查询）优化
+
+FROM 子句中的子查询称为派生表，MySQL 5.x 会把它物化为内存临时表，8.0 引入了派生表合并优化。
+
+```sql
+-- ❌ 派生表：MySQL 5.x 强制物化，产生临时表
+SELECT t.dept_id, t.cnt
+FROM (
+    SELECT dept_id, COUNT(*) AS cnt
+    FROM sys_user
+    WHERE status = 1
+    GROUP BY dept_id
+    HAVING cnt > 10
+) t
+ORDER BY t.cnt DESC;
+-- EXPLAIN: Extra = Using temporary（派生表物化）
+
+-- ✅ MySQL 8.0：优化器会尝试将派生表合并到外层（derived_merge）
+-- 验证是否合并：
+EXPLAIN FORMAT=JSON SELECT ...;
+-- 看 "materialized_from_subquery" 还是 "merged" 字段
+```
+
+```sql
+-- 派生表合并的前提：无聚合、无 DISTINCT、无 LIMIT、无 UNION
+-- 以下派生表无法合并，必然物化（接受临时表代价，或改写）
+
+-- 有 LIMIT 的派生表（常见于分页子查询）
+SELECT u.username, t.order_cnt
+FROM user u
+INNER JOIN (
+    SELECT user_id, COUNT(*) AS order_cnt
+    FROM `order`
+    GROUP BY user_id       -- 有聚合，无法合并
+) t ON t.user_id = u.id;
+
+-- 优化：如果派生表结果集会被复用，考虑用 WITH（CTE）代替
+WITH order_stats AS (
+    SELECT user_id, COUNT(*) AS order_cnt
+    FROM `order`
+    GROUP BY user_id
+)
+SELECT u.username, s.order_cnt
+FROM user u
+INNER JOIN order_stats s ON s.user_id = u.id;
+-- CTE 在 MySQL 8.0 会自动判断是否物化
+```
+
+---
+
+#### 6.6.4 标量子查询优化
+
+SELECT 列表中的子查询（标量子查询）每行执行一次，危害等同关联子查询。
+
+```sql
+-- ❌ SELECT 列中的标量子查询：每行执行一次，N 行 = N 次子查询
+SELECT
+    u.id,
+    u.username,
+    (SELECT role_name FROM sys_role r
+     INNER JOIN sys_user_role ur ON ur.role_id = r.id
+     WHERE ur.user_id = u.id LIMIT 1) AS first_role
+FROM sys_user u
+WHERE u.dept_id = 100;
+
+-- ✅ 改写为 LEFT JOIN（一次扫描）
+SELECT u.id, u.username, r.role_name AS first_role
+FROM sys_user u
+LEFT JOIN sys_user_role ur ON ur.user_id = u.id
+LEFT JOIN sys_role r       ON r.id = ur.role_id
+WHERE u.dept_id = 100
+GROUP BY u.id, u.username, r.role_name;  -- 取第一个匹配的角色
+```
+
+---
+
+#### 6.6.5 子查询优化决策树
+
+```
+子查询在哪里？
+├── SELECT 列（标量子查询）
+│     └── 改写为 LEFT JOIN + GROUP BY
+│
+├── FROM 子句（派生表）
+│     ├── MySQL 8.0：优化器自动合并（无聚合/LIMIT/UNION 时）
+│     └── 有聚合/LIMIT → 接受物化，或改写为 CTE
+│
+└── WHERE 子句
+      ├── 关联子查询（引用外层列）→ 改写为 JOIN
+      ├── IN (小集合) → 可用 IN，注意 NULL 问题
+      ├── NOT IN → 改用 NOT EXISTS 或 LEFT JOIN IS NULL
+      └── EXISTS → 外层小、子查询有索引时最佳
+```
 
 ---
 
