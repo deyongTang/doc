@@ -472,6 +472,7 @@ type 从好到坏排序（性能依次降低）：
 | `Using filesort` | 需要额外排序，无法利用索引排序 | ⚠️ 需优化 |
 | `Using temporary` | 使用了临时表（常见于 GROUP BY、DISTINCT） | ❌ 需优化 |
 | `Using join buffer` | JOIN 时没用到索引，用了内存 buffer | ⚠️ 需优化 |
+| `Backward index scan` | 逆向扫描索引（MySQL 8.0+），用于 DESC 排序，无需 filesort；**是否回表看有无 `Using index`** | ✅ 好 |
 
 > ⚠️ **Extra 中出现 `Using filesort` 或 `Using temporary` 是高危信号，会严重影响并发性能，必须优化。**
 
