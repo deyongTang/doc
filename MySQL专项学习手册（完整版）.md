@@ -354,6 +354,84 @@ SELECT * FROM user WHERE id NOT IN (1, 2, 3);
 | 范围查询后的列 | `age>18 AND status=1` | 等值列前置 |
 | 负向查询 | `!=`、`NOT IN` | 改写为正向查询 |
 | 字符集不一致 | JOIN 时两表字符集不同 | 统一字符集和排序规则 |
+| **优化器主动放弃索引** | 范围查询命中行数过多 + `SELECT *` | 见下方专项说明 |
+
+---
+
+### 场景七：优化器主动放弃索引（type = ALL，key = NULL）
+
+> ⚠️ **这不是索引失效，是优化器的主动决策。** `possible_keys` 有值说明索引存在且可用，但 `key = NULL` 说明优化器经过代价估算后，认为走索引比全表扫描更慢，主动放弃了。
+
+**典型 EXPLAIN 特征**
+
+```
+possible_keys: idx_dept_status
+         key: NULL        ← 放弃了
+        type: ALL         ← 全表扫描
+        rows: 500万
+```
+
+**触发条件（满足任意一条就可能放弃）**
+
+| 条件 | 说明 |
+|------|------|
+| 范围查询命中比例过高 | `dept_id > 500` 返回了表中 30%+ 的行，回表代价 > 全表扫描 |
+| `SELECT *` | 需要回表取全部列，索引失去覆盖优势 |
+| 索引列区分度太低 | 如 `status` 只有 0/1 两个值，走索引反而多一次树查找 |
+| 统计信息过期 | `ANALYZE TABLE` 长期未跑，优化器估算行数严重偏差 |
+
+**诊断步骤**
+
+```sql
+-- 第一步：看范围条件命中比例（超过 20~30% 即有风险）
+SELECT
+    COUNT(*) AS total,
+    SUM(dept_id > 500) AS matched,
+    ROUND(SUM(dept_id > 500) / COUNT(*) * 100, 2) AS pct
+FROM sys_user;
+
+-- 第二步：强制走索引对比（只用于验证，不用于生产）
+EXPLAIN SELECT * FROM sys_user FORCE INDEX (idx_dept_status_ct)
+WHERE dept_id > 500 AND status = 1;
+
+-- 第三步：查看优化器代价估算详情（MySQL 8.0+）
+SET optimizer_trace = 'enabled=on';
+SELECT * FROM sys_user WHERE dept_id > 500 AND status = 1;
+SELECT * FROM information_schema.OPTIMIZER_TRACE\G
+SET optimizer_trace = 'enabled=off';
+-- 重点看 trace 中 cost_info 的 read_cost 对比
+```
+
+**解决方案**
+
+```sql
+-- 方案一：调整索引列顺序（等值条件列前置，范围条件列后置）
+-- 原索引 (dept_id, status) → 改为 (status, dept_id)
+-- status = 1 先过滤，大幅缩小范围后再走 dept_id 范围扫描
+ALTER TABLE sys_user DROP INDEX idx_dept_status_ct;
+ALTER TABLE sys_user ADD INDEX idx_status_dept (status, dept_id);
+
+-- 方案二：用覆盖索引消除回表（去掉 SELECT *，只查需要的列）
+SELECT id, username, dept_id, status
+FROM sys_user
+WHERE dept_id > 500 AND status = 1;
+-- Extra = Using index → 无需回表，优化器更愿意走索引
+
+-- 方案三：更新统计信息（统计信息过期时使用）
+ANALYZE TABLE sys_user;
+```
+
+**核心原则**
+
+```
+优化器放弃索引的本质 = 回表代价 > 全表扫描代价
+
+回表代价 = 命中行数 × 随机 I/O 次数
+全表扫描代价 = 总行数 × 顺序 I/O（代价低得多）
+
+所以：命中行数越多 + SELECT * → 优化器越倾向全表扫描
+     命中行数越少 + 覆盖索引 → 优化器越倾向走索引
+```
 
 ---
 
