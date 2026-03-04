@@ -233,6 +233,67 @@ CREATE INDEX idx_name_age_city ON user(name, age, city);
 
 > ⚠️ **注意**：联合索引中，一旦某列使用了范围查询（`>`、`<`、`BETWEEN`、`LIKE` 前缀），后面的列就无法再走索引。
 
+#### 实战案例：name 和 age 各建独立索引 vs 联合索引
+
+> 通过这个案例理解两个独立索引如何"相互影响"，以及 Index Merge 机制。
+
+**场景**：
+
+```sql
+CREATE TABLE user (id INT PRIMARY KEY, name VARCHAR(50), age INT);
+CREATE INDEX idx_name ON user(name);   -- 独立索引
+CREATE INDEX idx_age  ON user(age);    -- 独立索引
+
+-- 执行查询
+SELECT * FROM user WHERE name = '张山' AND age = 15;
+```
+
+**MySQL 面临三条执行路径：**
+
+```
+路径 A：只用 idx_name
+  ① 扫描 idx_name B+ 树，取所有 name='张山' 的主键列表（假设 100 条）
+  ② 对 100 个主键逐一回表，读完整行，再用 age=15 过滤
+  回表次数 = count(name='张山') = 100 次
+
+路径 B：只用 idx_age
+  ① 扫描 idx_age B+ 树，取所有 age=15 的主键列表（假设 500 条）
+  ② 对 500 个主键逐一回表，读完整行，再用 name='张山' 过滤
+  回表次数 = count(age=15) = 500 次
+
+路径 C：Index Merge Intersection（两个索引同时扫描后取交集）
+  ① 扫描 idx_name，得主键集合 A = {1, 5, 9, 23, ...}（按主键升序）
+  ② 扫描 idx_age， 得主键集合 B = {5, 7, 9, 31, ...}（按主键升序）
+  ③ 归并取交集（类似双指针 merge）：交集 = {5, 9, ...}
+  ④ 只对交集主键回表，取完整行
+  回表次数 = count(最终结果) ← 大幅减少
+  EXPLAIN Extra 显示：Using intersect(idx_name,idx_age); Using where
+```
+
+**三种路径的扫描与回表开销对比：**
+
+| 执行路径 | 扫描行数（二级索引） | 回表次数 |
+|---------|------------------|---------|
+| 只用 idx_name | count(name='张山') | count(name='张山') |
+| 只用 idx_age | count(age=15) | count(age=15) |
+| Index Merge Intersection | count(name='张山') + count(age=15) | **count(最终结果)** |
+| **联合索引 (name, age)** | count(最终结果) | **count(最终结果)** |
+
+**优化器的选择逻辑**：根据统计信息估算代价，自动在三条路径中选最优。可用 EXPLAIN 观察：
+
+```sql
+EXPLAIN SELECT * FROM user WHERE name = '张山' AND age = 15;
+
+-- 走单索引：type=ref, key=idx_name, Extra=Using where
+-- 走交集：  type=index_merge, key=idx_name,idx_age, Extra=Using intersect(...); Using where
+```
+
+> 💡 **结论**：
+> - 两个独立索引走 **Index Merge** 时，回表次数 = 最终结果行数（与联合索引相同）
+> - 但 Index Merge 多扫描了两棵 B+ 树，还需要归并取交集，开销更大
+> - **联合索引 `(name, age)` 是最优解**：一次 B+ 树遍历直接精确定位，无多余扫描
+> - 口诀：**能用联合索引，就不要依赖 Index Merge**
+
 ### 2.5 前缀索引
 
 ```sql
