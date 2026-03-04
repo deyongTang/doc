@@ -245,7 +245,117 @@ CREATE INDEX idx_email_prefix ON user(email(20));
 
 > 💡 **前缀长度选取**：`SELECT COUNT(DISTINCT LEFT(email, N)) / COUNT(*) FROM user`，找到接近 1 的最小 N 值。
 
-### 2.6 索引设计原则总结
+### 2.6 实战案例：同一张表，三种索引类型的查询性能对比
+
+> 这是理解主键索引、普通索引、唯一索引行为差异的最直观案例。
+
+#### 场景设定
+
+```sql
+CREATE TABLE user (
+  id    INT PRIMARY KEY,       -- 主键索引（聚簇索引）
+  name  VARCHAR(50),           -- 待讨论：无索引 / 普通索引 / 唯一索引
+  age   INT
+);
+-- 表中有一行数据：id=1, name='张三'
+```
+
+对比以下两条查询：
+
+```sql
+-- 查询 A：按 name 查，只取 name
+SELECT name FROM user WHERE name = '张三';
+
+-- 查询 B：按主键查，取 id 和 name
+SELECT id, name FROM user WHERE id = 1;
+```
+
+---
+
+#### 情况一：name 无索引
+
+```
+查询 A：type = ALL，全表扫描，无论表有多大都要逐行遍历   ← 极慢
+查询 B：type = const，主键 B+ 树 3~4 次 I/O 直接定位    ← 极快
+```
+
+结论：**查询 B 完胜。**
+
+---
+
+#### 情况二：name 有普通索引
+
+```sql
+CREATE INDEX idx_name ON user(name);
+```
+
+```
+查询 A：
+  type = ref
+  走 name 二级索引 B+ 树，叶子节点存 (name, id)
+  SELECT 只需要 name → name 已在叶子节点 → 触发覆盖索引，无需回表
+  Extra = Using index
+
+查询 B：
+  type = const
+  走聚簇索引 B+ 树，叶子节点存完整行数据，直接取 id 和 name
+```
+
+```
+EXPLAIN type 优先级：const > ref
+```
+
+结论：**查询 B 仍然更快**（const > ref），但查询 A 已经不慢了，覆盖索引消除了回表。
+
+---
+
+#### 情况三：name 有唯一索引
+
+```sql
+CREATE UNIQUE INDEX uk_name ON user(name);
+```
+
+```
+查询 A：
+  type = const  ← 唯一索引等值查询，MySQL 确定最多 1 行，提升为 const
+  叶子节点存 (name, id)，SELECT name → 覆盖索引，无需回表
+  Extra = Using index
+
+查询 B：
+  type = const
+  聚簇索引，直接取完整行
+```
+
+**两条查询都是 type = const，执行代价几乎相同。**
+
+细微差异：
+
+| | 查询 A（唯一索引） | 查询 B（主键） |
+|--|--|--|
+| 叶子节点宽度 | 只存 `(name, id)`，较窄 | 存完整行，较宽 |
+| 每页可放条数 | 更多，树可能更矮 | 更少 |
+| 实际影响 | 可忽略不计 | — |
+
+结论：**两条基本持平**，唯一索引让 name 查询升格为 const，消除了与主键的差距。
+
+---
+
+#### 三种情况汇总
+
+| name 的索引类型 | 查询 A `type` | 查询 B `type` | 谁更快 |
+|----------------|--------------|--------------|--------|
+| 无索引          | ALL（全表扫）  | const        | B 完胜 |
+| 普通索引        | ref（覆盖索引）| const        | B 略快 |
+| **唯一索引**    | **const**（覆盖索引）| **const** | **基本持平** |
+
+> 💡 **核心结论**：
+> - **有没有索引** 决定了能不能快（全表扫 vs B+ 树）
+> - **普通索引 vs 唯一索引** 决定了 EXPLAIN `type` 是 `ref` 还是 `const`（唯一性让优化器敢做常量优化）
+> - **是否覆盖索引** 决定了有没有回表开销
+
+---
+
+### 2.7 索引设计原则总结
 
 | 原则 | 说明 |
 |------|------|
