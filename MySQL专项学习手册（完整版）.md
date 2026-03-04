@@ -233,66 +233,130 @@ CREATE INDEX idx_name_age_city ON user(name, age, city);
 
 > ⚠️ **注意**：联合索引中，一旦某列使用了范围查询（`>`、`<`、`BETWEEN`、`LIKE` 前缀），后面的列就无法再走索引。
 
-#### 实战案例：name 和 age 各建独立索引 vs 联合索引
+#### 实战案例：多条件查询时，两个独立索引如何工作（Index Merge 机制）
 
-> 通过这个案例理解两个独立索引如何"相互影响"，以及 Index Merge 机制。
+> 实际业务中查询条件多变，许多团队选择对各字段分别建独立索引，而非联合索引。
+> 这个案例深入拆解：MySQL 在 AND 条件下如何利用多个独立索引，扫描多少数据，回表多少次。
 
-**场景**：
+**场景设定（表有 10000 行）**：
 
 ```sql
 CREATE TABLE user (id INT PRIMARY KEY, name VARCHAR(50), age INT);
 CREATE INDEX idx_name ON user(name);   -- 独立索引
 CREATE INDEX idx_age  ON user(age);    -- 独立索引
 
--- 执行查询
 SELECT * FROM user WHERE name = '张山' AND age = 15;
+-- 假设：name='张山' 命中 200 行，age=15 命中 1000 行，交集（最终结果）5 行
 ```
 
-**MySQL 面临三条执行路径：**
+---
+
+##### 路径一：只用 idx_name（优化器最常选）
 
 ```
-路径 A：只用 idx_name
-  ① 扫描 idx_name B+ 树，取所有 name='张山' 的主键列表（假设 100 条）
-  ② 对 100 个主键逐一回表，读完整行，再用 age=15 过滤
-  回表次数 = count(name='张山') = 100 次
+① 走 idx_name B+ 树，扫描叶子节点，收集所有 name='张山' 的主键
+   叶子节点内容：[name='张山', id=5] → [name='张山', id=9] → [name='张山', id=23] → ...
+   得到主键列表 = [5, 9, 23, 47, 88, ...]，共 200 个
 
-路径 B：只用 idx_age
-  ① 扫描 idx_age B+ 树，取所有 age=15 的主键列表（假设 500 条）
-  ② 对 500 个主键逐一回表，读完整行，再用 name='张山' 过滤
-  回表次数 = count(age=15) = 500 次
+② 对 200 个主键逐一回表，去聚簇索引取完整行
+   每次回表：根据主键随机 I/O，读取该行的 name、age、其他所有列
 
-路径 C：Index Merge Intersection（两个索引同时扫描后取交集）
-  ① 扫描 idx_name，得主键集合 A = {1, 5, 9, 23, ...}（按主键升序）
-  ② 扫描 idx_age， 得主键集合 B = {5, 7, 9, 31, ...}（按主键升序）
-  ③ 归并取交集（类似双指针 merge）：交集 = {5, 9, ...}
-  ④ 只对交集主键回表，取完整行
-  回表次数 = count(最终结果) ← 大幅减少
-  EXPLAIN Extra 显示：Using intersect(idx_name,idx_age); Using where
+③ 取到完整行后，用 age=15 过滤，不满足的直接丢弃
+   200 行回表后，只有 5 行满足 age=15
+
+扫描二级索引：200 行
+回表次数：200 次（每次都是随机 I/O）
+最终返回：5 行
 ```
 
-**三种路径的扫描与回表开销对比：**
+**EXPLAIN 特征**：`type=ref, key=idx_name, Extra=Using where`
+`Using where` 表示 age=15 是在回表后由 Server 层过滤，idx_age 完全没用上。
 
-| 执行路径 | 扫描行数（二级索引） | 回表次数 |
-|---------|------------------|---------|
-| 只用 idx_name | count(name='张山') | count(name='张山') |
-| 只用 idx_age | count(age=15) | count(age=15) |
-| Index Merge Intersection | count(name='张山') + count(age=15) | **count(最终结果)** |
-| **联合索引 (name, age)** | count(最终结果) | **count(最终结果)** |
+---
 
-**优化器的选择逻辑**：根据统计信息估算代价，自动在三条路径中选最优。可用 EXPLAIN 观察：
+##### 路径二：Index Merge Intersection（AND 条件的交集优化）
+
+当两个索引的选择性都不高（单独用任一个都要回表很多次），优化器可能选这条路：
+
+```
+① 同时扫描两棵 B+ 树，分别收集主键列表：
+
+   idx_name 扫描（name='张山'）：
+     叶子节点按主键升序：id=5 → id=9 → id=23 → id=47 → id=88 → ...
+     主键列表 A = [5, 9, 23, 47, 88, ...]  ← 天然有序，共 200 个
+
+   idx_age 扫描（age=15）：
+     叶子节点按主键升序：id=3 → id=9 → id=31 → id=55 → id=88 → ...
+     主键列表 B = [3, 9, 31, 55, 88, ...]  ← 天然有序，共 1000 个
+
+② 双指针归并取交集（利用两个列表均有序的特性）：
+     A[0]=5,  B[0]=3  → 3<5，B 右移
+     A[0]=5,  B[1]=9  → 5<9，A 右移
+     A[1]=9,  B[1]=9  → 相等！加入交集，双指针同时右移
+     A[2]=23, B[2]=31 → 23<31，A 右移
+     ... 以此类推
+     交集 = [9, 88, ...]，共 5 个主键
+
+③ 只对 5 个主键回表，按主键顺序读聚簇索引（近似顺序 I/O）
+
+扫描二级索引：200 + 1000 = 1200 行
+回表次数：5 次（仅对交集回表！）
+最终返回：5 行
+```
+
+**EXPLAIN 特征**：`type=index_merge, key=idx_name,idx_age, Extra=Using intersect(idx_name,idx_age); Using where`
+
+---
+
+##### 优化器怎么在两条路径之间选择？
+
+优化器对每条路径估算 **I/O 代价**（随机 I/O 远比顺序 I/O 贵）：
+
+| 路径 | 顺序 I/O（扫二级索引） | 随机 I/O（回表） | 额外操作 |
+|------|-------------------|---------------|---------|
+| 只用 idx_name | 200 次顺序 | **200 次随机** | 无 |
+| 只用 idx_age | 1000 次顺序 | **1000 次随机** | 无 |
+| Index Merge | 1200 次顺序 | **5 次随机** | 归并交集 |
+
+当单索引命中行数多（回表代价大），而交集很小时，Index Merge 划算。
+当单索引选择性极高（如 name 只命中 3 行），直接用单索引更快，不值得再扫第二棵树。
 
 ```sql
+-- 用 EXPLAIN 验证优化器的实际选择
 EXPLAIN SELECT * FROM user WHERE name = '张山' AND age = 15;
 
--- 走单索引：type=ref, key=idx_name, Extra=Using where
--- 走交集：  type=index_merge, key=idx_name,idx_age, Extra=Using intersect(...); Using where
+-- 强制走单索引（对比测试用）
+EXPLAIN SELECT * FROM user FORCE INDEX(idx_name) WHERE name = '张山' AND age = 15;
+EXPLAIN SELECT * FROM user FORCE INDEX(idx_age)  WHERE name = '张山' AND age = 15;
 ```
 
-> 💡 **结论**：
-> - 两个独立索引走 **Index Merge** 时，回表次数 = 最终结果行数（与联合索引相同）
-> - 但 Index Merge 多扫描了两棵 B+ 树，还需要归并取交集，开销更大
-> - **联合索引 `(name, age)` 是最优解**：一次 B+ 树遍历直接精确定位，无多余扫描
-> - 口诀：**能用联合索引，就不要依赖 Index Merge**
+---
+
+##### 分开建索引的灵活性
+
+查询条件多变时，独立索引能灵活覆盖各种单条件查询，这正是其优势：
+
+```sql
+SELECT * FROM user WHERE name = '张山';              -- 走 idx_name，type=ref
+SELECT * FROM user WHERE age = 15;                  -- 走 idx_age，type=ref
+SELECT * FROM user WHERE name = '张山' AND age = 15; -- 走 idx_name 或 Index Merge
+SELECT * FROM user WHERE name = '张山' OR  age = 15; -- 走 Index Merge Union（OR 场景）
+```
+
+OR 场景下的 Index Merge Union：
+
+```
+idx_name 扫描 name='张山' → 主键列表 A
+idx_age  扫描 age=15      → 主键列表 B
+取并集并去重（两个有序列表归并去重）→ 对结果回表
+Extra = Using union(idx_name,idx_age); Using where
+```
+
+> 💡 **小结**：
+> - 两个独立索引在 AND 条件下，MySQL 有两种选择：**用选择性更高的那个**（单索引）或 **Index Merge Intersection**（取主键交集后再回表）
+> - Index Merge 的本质优势是把"大量随机回表"变成"少量随机回表 + 较多顺序扫描"
+> - 优化器根据统计信息自动选择，可通过 EXPLAIN 的 `type=index_merge` 确认
+> - 独立索引的代价：Index Merge 需要多扫一棵 B+ 树 + 归并操作，联合索引无此开销
 
 ### 2.5 前缀索引
 
