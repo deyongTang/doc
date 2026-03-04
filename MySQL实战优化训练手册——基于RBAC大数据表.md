@@ -640,15 +640,14 @@ WHERE dept_id > 500 AND status = 1;
 
 ## 第六章：实战三：覆盖索引消除回表
 
-> **目标**：通过覆盖索引让查询完全在索引层完成，消除回表开销。
+> **目标**：理解回表的三层代价，通过覆盖索引让查询完全在索引层完成。
 
 ### 6.1 场景：用户列表分页（只显示部分字段）
 
-常见的列表页，只需展示 id、username、real_name、dept_id、status，不需要所有字段：
+常见的列表页，只需展示 id、username、real_name、dept_id、status：
 
 ```sql
 -- 当前索引：idx_dept_status_ct(dept_id, status, create_time)
--- 查询
 SELECT id, username, real_name, dept_id, status
 FROM sys_user
 WHERE dept_id = 100 AND status = 1
@@ -656,7 +655,7 @@ ORDER BY create_time DESC
 LIMIT 20;
 ```
 
-**查看执行计划：**
+**先看执行计划，确认存在回表：**
 
 ```sql
 EXPLAIN SELECT id, username, real_name, dept_id, status
@@ -665,14 +664,38 @@ WHERE dept_id = 100 AND status = 1
 ORDER BY create_time DESC
 LIMIT 20;
 -- Extra: Using index condition（有回表）
--- 因为 username、real_name 不在索引中，需要回聚簇索引取完整行
+-- username、real_name 不在索引里，需要回聚簇索引取完整行
 ```
 
-**优化：把查询列加入索引，实现覆盖索引**
+**理解为什么慢——回表的三层代价：**
+
+```
+idx_dept_status_ct 叶子节点内容：
+┌──────────┬────────┬─────────────────────┬────────┐
+│ dept_id  │ status │    create_time      │  PK    │
+├──────────┼────────┼─────────────────────┼────────┤
+│  100     │   1    │ 2024-03-01 10:00:00 │ 82341  │
+│  100     │   1    │ 2024-03-01 11:30:00 │ 15692  │  ← 主键乱序！
+│  100     │   1    │ 2024-03-02 09:15:00 │ 99871  │
+│  ...     │  ...   │        ...          │  ...   │
+└──────────┴────────┴─────────────────────┴────────┘
+                                                │
+                              需要 username、real_name
+                                                ↓
+                         回聚簇索引取完整行（随机 I/O）
+
+代价一：主键乱序 → 每次回表都是随机 I/O（磁盘寻道）
+代价二：每次回表 = 额外遍历一次聚簇索引 B+ 树（CPU 开销）
+代价三：回表要读聚簇索引页 → 与写事务竞争页锁（高并发等待）
+```
+
+对于这条只返回 20 行的查询，代价还可接受。但如果是深分页或高频接口，这三层代价叠加会非常明显。
+
+**优化：把查询列加入索引，彻底消灭回表：**
 
 ```sql
--- 方案：加一个包含 username、real_name 的覆盖索引
--- 注意：列顺序 = WHERE 列 + ORDER BY 列 + SELECT 列
+-- 列顺序规则：WHERE 过滤列 → ORDER BY 列 → SELECT 需要的额外列
+-- id（主键）自动包含在每个索引叶子节点，无需显式添加
 CREATE INDEX idx_dept_status_ct_cover
   ON sys_user (dept_id, status, create_time, username, real_name);
 ```
@@ -684,40 +707,45 @@ FROM sys_user
 WHERE dept_id = 100 AND status = 1
 ORDER BY create_time DESC
 LIMIT 20;
--- Extra: Using index ← 覆盖索引！无需回表 ✅
+-- Extra: Using index  ← 覆盖索引，不碰聚簇索引 ✅
 ```
 
 ### 6.2 覆盖索引 vs 回表性能对比
 
 ```sql
--- 对比测试（先关闭查询缓存）
-SET SESSION query_cache_type = 0;
-
--- 方式1：强制走主键（全表扫描，模拟无索引）
+-- 对比测试：手动指定索引，观察耗时差异
+-- 方式1：走旧索引（有回表）
 SELECT SQL_NO_CACHE id, username, real_name, dept_id, status
-FROM sys_user FORCE INDEX (PRIMARY)
+FROM sys_user USE INDEX (idx_dept_status_ct)
 WHERE dept_id = 100 AND status = 1
+ORDER BY create_time DESC
 LIMIT 20;
 
--- 方式2：走覆盖索引
+-- 方式2：走覆盖索引（无回表）
 SELECT SQL_NO_CACHE id, username, real_name, dept_id, status
 FROM sys_user USE INDEX (idx_dept_status_ct_cover)
 WHERE dept_id = 100 AND status = 1
 ORDER BY create_time DESC
 LIMIT 20;
+
+-- 低并发下差距有限（数据在内存时随机IO代价小）
+-- 高并发压测下，覆盖索引版本的 CPU 和响应时间优势会明显放大
 ```
 
 ### 6.3 什么时候不适合覆盖索引
 
-- SELECT 列太多（如 SELECT *）→ 索引太宽，写入开销大
-- 字段更新频繁（每次更新都要维护宽索引）
-- 索引已经满足过滤，回表次数本来就很少
+| 场景 | 原因 | 建议 |
+|------|------|------|
+| SELECT 列太多（接近 SELECT *） | 索引过宽，写入时维护开销大 | 不加，接受回表 |
+| 高频更新的列（如 status、score） | 每次更新都重建索引 | 不加宽索引，考虑读写分离 |
+| 回表次数本来就少（< 100 行） | 代价可接受 | 不需要优化 |
+| 并发低、数据全在 Buffer Pool | 随机 IO 代价几乎没有 | 优先级低 |
 
 ---
 
 ## 第七章：实战四：深分页优化
 
-> **目标**：理解为什么 `LIMIT 100万, 20` 极慢，掌握两种优化方案。
+> **目标**：理解深分页慢的两层代价，掌握延迟关联和游标翻页两种解法及其边界。
 
 ### 7.1 复现深分页慢查询
 
@@ -726,79 +754,145 @@ LIMIT 20;
 SELECT id, username, real_name, status
 FROM sys_user
 WHERE status = 1
-ORDER BY id
+ORDER BY create_time
 LIMIT 0, 20;
 
 -- 第 5 万页（跳过 100 万行），极慢！
 SELECT id, username, real_name, status
 FROM sys_user
 WHERE status = 1
-ORDER BY id
+ORDER BY create_time
 LIMIT 1000000, 20;
+```
 
--- EXPLAIN 分析
+```sql
 EXPLAIN SELECT id, username, real_name, status
 FROM sys_user
 WHERE status = 1
-ORDER BY id
+ORDER BY create_time
 LIMIT 1000000, 20;
--- rows 仍然是 100 万，MySQL 要扫描并丢弃 100 万行，只返回最后 20 行！
+-- rows ≈ 100 万，type = ALL 或 index
 ```
 
-### 7.2 优化方案一：子查询定位（任意跳页）
+**为什么慢——两层代价叠加：**
+
+```
+MySQL 实际执行步骤：
+1. 走二级索引（status + create_time），从第 1 行扫到第 1000020 行
+2. 对这 1000020 行逐行回表，从聚簇索引取完整数据（real_name 不在索引里）
+3. 丢弃前 1000000 行
+4. 返回最后 20 行
+
+代价拆解：
+┌─────────────────────────────────────────────────────┐
+│ 第一层：无效索引扫描                                   │
+│   MySQL 没有"跳过 offset 行"的能力，必须逐行扫         │
+│   offset 越大，扫描行数越多，代价线性增长               │
+├─────────────────────────────────────────────────────┤
+│ 第二层：回表放大代价                                   │
+│   SELECT * 或包含非索引列 → 每行都要随机 I/O 回表       │
+│   1000020 次随机 I/O（vs 游标分页的 20 次）             │
+│   两层叠加：代价 = 扫描行数 × 每行随机 I/O             │
+└─────────────────────────────────────────────────────┘
+```
+
+### 7.2 优化方案一：延迟关联（任意跳页）
+
+**核心思路**：把回表推迟到只对目标 20 行执行，而不是对全部 1000020 行执行。
 
 ```sql
--- 核心思路：先用覆盖索引找到目标页的 id 范围，再用主键查完整数据
-SELECT u.*
+-- ❌ 原始写法：回表 1000020 次
+SELECT id, username, real_name, status
+FROM sys_user
+WHERE status = 1
+ORDER BY create_time
+LIMIT 1000000, 20;
+
+-- ✅ 延迟关联：回表只有 20 次
+SELECT u.id, u.username, u.real_name, u.status
 FROM sys_user u
 INNER JOIN (
-  SELECT id
-  FROM sys_user
-  WHERE status = 1
-  ORDER BY id
-  LIMIT 1000000, 20       -- 内层只查 id，走覆盖索引，速度快
+    -- 内层：只查 id，走覆盖索引，不回表
+    SELECT id
+    FROM sys_user
+    WHERE status = 1
+    ORDER BY create_time
+    LIMIT 1000000, 20
 ) t ON u.id = t.id;
 ```
 
-**EXPLAIN 对比：**
-
 ```sql
-EXPLAIN SELECT u.*
+-- EXPLAIN 验证
+EXPLAIN SELECT u.id, u.username, u.real_name, u.status
 FROM sys_user u
 INNER JOIN (
-  SELECT id FROM sys_user WHERE status = 1 ORDER BY id LIMIT 1000000, 20
+    SELECT id FROM sys_user WHERE status = 1 ORDER BY create_time LIMIT 1000000, 20
 ) t ON u.id = t.id;
--- 内层子查询：type=index，Extra=Using index（覆盖索引）
--- 外层：type=eq_ref（主键等值 JOIN），极快
+-- 内层：Extra = Using index（覆盖索引，无回表）
+-- 外层：type = eq_ref（按主键取 20 行，极快）
+```
+
+**效果与局限：**
+
+```
+          索引扫描行数    回表次数    随机 I/O
+原始写法    1000020       1000020     1000020 次
+延迟关联    1000020          20          20 次
+游标分页        20            20          20 次
+              ↑
+     延迟关联没有减少索引扫描行数
+     offset 到千万级时，光扫索引也很慢
 ```
 
 ### 7.3 优化方案二：游标翻页（连续翻页，性能最优）
 
-```sql
--- 记录上一页最后一条记录的 id，下次从此 id 之后开始查
--- 第一页
-SELECT id, username, real_name, status
-FROM sys_user
-WHERE status = 1 AND id > 0
-ORDER BY id
-LIMIT 20;
--- 假设最后一条的 id = 982753
+**核心思路**：记录上一页最后一条记录的位置，下次从此处继续，彻底跳过前面所有行。
 
--- 第二页（游标继续）
-SELECT id, username, real_name, status
+```sql
+-- 第一页（初始游标）
+SELECT id, username, real_name, status, create_time
 FROM sys_user
-WHERE status = 1 AND id > 982753
-ORDER BY id
+WHERE status = 1
+ORDER BY create_time, id      -- 排序必须唯一稳定，用 id 打破 create_time 相同的平局
 LIMIT 20;
--- 无论翻到第几页，都只扫描 20 行！
+-- 记录最后一行：create_time = '2024-03-15 14:30:00', id = 328741
+
+-- 第二页（传入上一页游标）
+SELECT id, username, real_name, status, create_time
+FROM sys_user
+WHERE status = 1
+  AND (create_time, id) > ('2024-03-15 14:30:00', 328741)
+ORDER BY create_time, id
+LIMIT 20;
+
+-- 第 N 页：无论翻到哪一页，执行计划完全一致：
+-- 索引直接定位到游标位置 → 顺序扫描 20 行 → 回表 20 次 → 返回 20 行
+-- 代价恒定，不随页数增加
 ```
 
-### 7.4 两种方案对比
+```sql
+-- EXPLAIN 验证（任意页）
+EXPLAIN SELECT id, username, real_name, status, create_time
+FROM sys_user
+WHERE status = 1
+  AND (create_time, id) > ('2024-03-15 14:30:00', 328741)
+ORDER BY create_time, id
+LIMIT 20;
+-- type = range，rows ≈ 20，Extra = Using index condition
+-- 需要索引：idx_status_create_time_id(status, create_time, id)
+```
 
-| 方案 | 适用场景 | 性能 | 缺点 |
-|------|---------|------|------|
-| 子查询定位 | 后台管理，支持任意跳页 | 中等 | 实现稍复杂，仍有内层扫描开销 |
-| 游标翻页 | 移动端/APP 无限滚动、下一页 | 最优（O(1)）| 不支持跳页，需记录游标值 |
+> **注意**：游标分页不支持跳页（不能直接跳到第 100 页），产品形态必须是"上一页/下一页"或无限滚动。
+
+### 7.4 三种方案对比
+
+| 方案 | 索引扫描行数 | 回表次数 | 支持跳页 | 适用场景 |
+|------|------------|---------|---------|---------|
+| 原始 LIMIT offset | offset+limit | offset+limit | ✅ | 数据量小（offset < 1 万） |
+| 延迟关联 | offset+limit | limit（20）| ✅ | 中等深度分页，需要跳页的后台管理 |
+| 游标翻页 | limit（20）| limit（20）| ❌ | 深分页、APP 无限滚动、下一页场景 |
+
+> 优先使用游标翻页，如果产品需要跳页则用延迟关联，两者都比原始写法有数量级的提升。
 
 ---
 
